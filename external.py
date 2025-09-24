@@ -10,11 +10,10 @@ OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 # ----------------------------
-# Style Tweaks & Cat Silhouette
+# Style Tweaks
 # ----------------------------
 st.set_page_config(page_title="Daylight & Energy", layout="wide")
 
-# Grey headings + slightly smaller margins
 st.markdown("""
     <style>
     h2, h3, .stSubheader, .stMarkdown {
@@ -29,7 +28,7 @@ st.markdown("""
 # Title with cat silhouette
 st.markdown("""
     <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h1 style="margin: 0;">🌤️ External Lighting Energy Calculator</h1>
+        <h1 style="color:#444; margin: 0;">🌤️ External Lighting Energy Calculator</h1>
         <img src="https://www.svgrepo.com/show/527635/cat.svg" 
              alt="cat" width="45" style="opacity:0.4; margin-left:10px;">
     </div>
@@ -87,6 +86,7 @@ with st.sidebar:
     st.header("💡 Lighting Inputs")
     facade_area = st.number_input("Façade area (m²)", min_value=0.0, value=1000.0, step=10.0)
     lpd_w_per_m2 = st.number_input("Lighting Power Density (W/m²)", min_value=0.0, value=1.6, step=0.1)
+    installed_kw = st.number_input("Installed lighting load (kW, overrides above if >0)", min_value=0.0, value=0.0, step=0.1)
     control_factor = st.slider("Control factor (0–1)", 0.0, 1.0, 0.8, 0.05)
 
     st.markdown("---")
@@ -94,10 +94,18 @@ with st.sidebar:
     ghi_on_threshold = st.number_input("Lights ON below (W/m²)", min_value=0.0, value=10.0, step=1.0)
     ghi_off_threshold = st.number_input("Lights OFF above (W/m²)", min_value=0.0, value=50.0, step=5.0)
 
+    st.markdown("---")
+    st.header("⏱️ Exclusion Hours")
+    use_excl = st.checkbox("Enable exclusion hours?")
+    excl_range = None
+    if use_excl:
+        excl_range = st.slider("Select exclusion hours (lights OFF during these)", 0, 23, (0, 6))
+
 st.markdown(
     f"> ℹ️ **Night-only:** Lights ON during dark hours only.  \n"
     f"**Hourly GHI:** Lights turn ON when GHI < **{ghi_on_threshold:.0f} W/m²** "
     f"and stay ON until GHI > **{ghi_off_threshold:.0f} W/m²**.  \n"
+    f"Exclusion hours (if enabled) override both modes.  \n"
     f"Data source: [Open-Meteo Weather API](https://open-meteo.com/en/docs)",
     unsafe_allow_html=True,
 )
@@ -122,7 +130,8 @@ def weather_icon(code):
 
 @st.cache_data(ttl=7*24*3600)
 def fetch_city_daily(lat, lon, tz, year):
-    params = {"latitude": lat, "longitude": lon, "start_date": f"{year}-01-01", "end_date": f"{year}-12-31",
+    params = {"latitude": lat, "longitude": lon,
+              "start_date": f"{year}-01-01", "end_date": f"{year}-12-31",
               "daily": "daylight_duration", "timezone": tz}
     r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
     r.raise_for_status()
@@ -134,7 +143,8 @@ def fetch_city_daily(lat, lon, tz, year):
 
 @st.cache_data(ttl=7*24*3600)
 def fetch_city_hourly(lat, lon, tz, year):
-    params = {"latitude": lat, "longitude": lon, "start_date": f"{year}-01-01", "end_date": f"{year}-12-31",
+    params = {"latitude": lat, "longitude": lon,
+              "start_date": f"{year}-01-01", "end_date": f"{year}-12-31",
               "hourly": "shortwave_radiation", "timezone": tz}
     r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=60)
     r.raise_for_status()
@@ -149,46 +159,76 @@ def monthly_totals_daily(df):
                     "August","September","October","November","December"], ordered=True)
     return agg.sort_values("month")
 
-def monthly_lights_on_from_hourly(df, on_thr, off_thr):
+def monthly_lights_on_from_hourly(df, on_thr, off_thr, exclusion_range=None):
     lights_on = False
     states = []
-    for ghi in df["GHI_Wm2"]:
+    for dt, ghi in zip(df["datetime"], df["GHI_Wm2"]):
+        hour = dt.hour
+        in_exclusion = False
+        if exclusion_range:
+            if exclusion_range[0] < exclusion_range[1]:
+                in_exclusion = exclusion_range[0] <= hour < exclusion_range[1]
+            else:  # wrap midnight
+                in_exclusion = hour >= exclusion_range[0] or hour < exclusion_range[1]
+
+        if in_exclusion:
+            states.append(False)
+            continue
+
         if not lights_on and ghi < on_thr:
             lights_on = True
         elif lights_on and ghi > off_thr:
             lights_on = False
         states.append(lights_on)
+
     df["lights_on_flag"] = states
     df["lights_on_h"] = df["lights_on_flag"].astype(int)
     df["month"] = df["datetime"].dt.month
     agg = df.groupby("month")["lights_on_h"].sum().reset_index()
-    agg["Month"] = pd.Categorical(agg["month"].apply(lambda m: date(2000, m, 1).strftime("%B")),
+    agg["Month"] = pd.Categorical(
+        agg["month"].apply(lambda m: date(2000, m, 1).strftime("%B")),
         categories=["January","February","March","April","May","June","July",
-                    "August","September","October","November","December"], ordered=True)
+                    "August","September","October","November","December"],
+        ordered=True
+    )
     return agg.sort_values("month")
 
-def process_city(city, on_thr, off_thr):
+def process_city(city, on_thr, off_thr, exclusion_range=None):
     daily = fetch_city_daily(city.lat, city.lon, city.tz, BASELINE_YEAR)
     hourly = fetch_city_hourly(city.lat, city.lon, city.tz, BASELINE_YEAR)
+
+    # adjust night hours if exclusion enabled
+    if exclusion_range:
+        excl_hours = (exclusion_range[1] - exclusion_range[0]) % 24
+        daily["night_h"] = (24 - daily["daylight_h"]) - excl_hours
+        daily["night_h"] = daily["night_h"].clip(lower=0)
+
     agg = monthly_totals_daily(daily)
     agg["lights_on_h"] = agg["night_h"]
-    monthly_ghi = monthly_lights_on_from_hourly(hourly.copy(), on_thr, off_thr)
+
+    monthly_ghi = monthly_lights_on_from_hourly(hourly.copy(), on_thr, off_thr, exclusion_range)
     agg = agg.merge(monthly_ghi, on=["month", "Month"], suffixes=("", "_ghi"))
-    agg["Energy Night (kWh)"] = (lpd_w_per_m2 * facade_area * agg["lights_on_h"] * control_factor) / 1000
-    agg["Energy GHI (kWh)"] = (lpd_w_per_m2 * facade_area * agg["lights_on_h_ghi"] * control_factor) / 1000
+
+    if installed_kw > 0:
+        installed_w = installed_kw * 1000
+    else:
+        installed_w = lpd_w_per_m2 * facade_area
+
+    agg["Energy Night (kWh)"] = (installed_w * agg["lights_on_h"] * control_factor) / 1000
+    agg["Energy GHI (kWh)"] = (installed_w * agg["lights_on_h_ghi"] * control_factor) / 1000
     return agg
 
 # ----------------------------
 # Run Calculations
 # ----------------------------
 city_obj_1 = ALL_CITIES[CITY_NAMES.index(city_choice_1)]
-agg1 = process_city(city_obj_1, ghi_on_threshold, ghi_off_threshold)
+agg1 = process_city(city_obj_1, ghi_on_threshold, ghi_off_threshold, excl_range if use_excl else None)
 weather1 = fetch_current_weather(city_obj_1)
 
 agg2, weather2 = None, None
 if city_choice_2 != "None":
     city_obj_2 = ALL_CITIES[CITY_NAMES.index(city_choice_2)]
-    agg2 = process_city(city_obj_2, ghi_on_threshold, ghi_off_threshold)
+    agg2 = process_city(city_obj_2, ghi_on_threshold, ghi_off_threshold, excl_range if use_excl else None)
     weather2 = fetch_current_weather(city_obj_2)
 
 # ----------------------------
@@ -219,7 +259,8 @@ show_metrics(city_choice_1, agg1)
 if agg2 is not None and not agg2.empty:
     show_metrics(city_choice_2, agg2)
 
-st.caption(f"🔧 Calculated with ON < **{ghi_on_threshold:.0f} W/m²**, OFF > **{ghi_off_threshold:.0f} W/m²** (hysteresis enabled).")
+st.caption(f"🔧 Calculated with ON < **{ghi_on_threshold:.0f} W/m²**, "
+           f"OFF > **{ghi_off_threshold:.0f} W/m²** (hysteresis enabled).")
 
 # ----------------------------
 # Line Chart (Fixed Y-axis)
@@ -237,7 +278,7 @@ line_chart = (
     .mark_line(point=True, interpolate="monotone")
     .encode(
         x=alt.X("Month", axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("Hours", scale=alt.Scale(domain=[100, 600])),  # Fixed range
+        y=alt.Y("Hours", scale=alt.Scale(domain=[100, 600])),
         color="City",
         strokeDash="Type",
         tooltip=["City","Month","Type","Hours"]
@@ -254,8 +295,7 @@ if agg2 is not None and not agg2.empty:
     merged = agg1[["Month","lights_on_h","lights_on_h_ghi","Energy Night (kWh)","Energy GHI (kWh)"]].merge(
         agg2[["Month","lights_on_h","lights_on_h_ghi","Energy Night (kWh)","Energy GHI (kWh)"]],
         on="Month", suffixes=(f" ({city_choice_1})", f" ({city_choice_2})"))
-    st.dataframe(merged.round(1), use_container_width=True)
+    st.dataframe(merged.round(1), width="stretch")
 else:
     st.dataframe(agg1[["Month","lights_on_h","lights_on_h_ghi","Energy Night (kWh)","Energy GHI (kWh)"]].round(1),
-                 use_container_width=True)
-
+                 width="stretch")
